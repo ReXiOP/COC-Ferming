@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.log
+temp_screen.png
+test_screenshot.png
+.pytest_cache/
