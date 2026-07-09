@@ -32,7 +32,7 @@ class Vision:
             torch.load = safe_load
 
             self.yolo_model = yolov5.load('keremberke/yolov5s-clash-of-clans')
-            self.yolo_model.conf = 0.25
+            self.yolo_model.conf = 0.15
             self.yolo_model.iou = 0.45
             self.yolo_model.agnostic = False
             self.yolo_model.multi_label = False

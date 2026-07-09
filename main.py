@@ -6,6 +6,7 @@ import numpy as np
 import config
 from bot_core import BotCore
 from vision import Vision
+from banner import print_banner
 
 class CocBot:
     def __init__(self):
@@ -17,6 +18,7 @@ class CocBot:
         self.running = True
 
     def start(self):
+        print_banner()
         logger.info("Starting Clash of Clans Farming Bot...")
         
         if not self.bot.connect():
@@ -109,40 +111,50 @@ class CocBot:
     def handle_attacking(self, screen):
         logger.info("Commencing refined 'Smart' attack strategy!")
         
-        # Take initial screenshot to detect Town Hall level
-        initial_screen = self.bot.take_screenshot("temp_screen.png")
-        if initial_screen is not None:
-            th_level = "Unknown"
-            # Detect TH
-            for i in range(14, 0, -1):
-                th_temp = f"th_{i}"
-                if self.vision.find_image(th_temp, initial_screen, threshold=0.55):
-                    th_level = str(i)
-                    break
-                for sub in [".1", ".2", ".3", ".4", ".5"]:
-                    sub_temp = f"th_{i}{sub}"
-                    if sub_temp in self.vision.templates:
-                        if self.vision.find_image(sub_temp, initial_screen, threshold=0.55):
-                            th_level = f"{i}{sub}"
-                            break
-                if th_level != "Unknown":
-                    break
-            
-            logger.info(f"[BASE INFO] Enemy Town Hall Level: {th_level}")
-        
         h, w = screen.shape[:2]
         
         # Define deployment zones
-        # Top-Right edge: slightly inside the screen to avoid notification bars and red zones
-        edge_start = (int(w * 0.5), int(h * 0.1))  # Top middle (10% from top)
-        edge_end = (int(w * 0.9), int(h * 0.5))    # Right middle (10% from right edge)
+        edge_start = (int(w * 0.5), int(h * 0.1))
+        edge_end = (int(w * 0.9), int(h * 0.5))
         core = (int(w * 0.5), int(h * 0.5))
         
         YOLO_CLASSES = [
             'ad', 'airsweeper', 'bombtower', 'canon', 'clancastle', 'eagle', 
             'inferno', 'kingpad', 'mortar', 'queenpad', 'rcpad', 'scattershot', 
-            'th13', 'wardenpad', 'wizztower', 'xbow'
+            'wardenpad', 'wizztower', 'xbow'
         ]
+        
+        # ============================================================
+        # PHASE 0: PRE-SCAN BASE WITH YOLO (before any troops deploy)
+        # ============================================================
+        logger.info("=" * 50)
+        logger.info("[INTEL] Scanning enemy base with YOLOv5...")
+        
+        # Take a clean screenshot of the base before deployment bar obscures it
+        scan_screen = self.bot.take_screenshot("base_scan.png")
+        
+        # Run YOLO detection on the full base
+        defense_map = {}  # { "eagle": [(x,y,conf), ...], "inferno": [(x,y,conf), ...] }
+        all_defenses = []
+        
+        if scan_screen is not None:
+            detections = self.vision.detect_objects(scan_screen)
+            for cls_name, cx, cy, conf in detections:
+                if cls_name not in defense_map:
+                    defense_map[cls_name] = []
+                defense_map[cls_name].append((cx, cy, conf))
+                all_defenses.append((cls_name, cx, cy, conf))
+            
+            # Log the intel report
+            if defense_map:
+                logger.info(f"[INTEL] Detected {len(all_defenses)} structures:")
+                for cls, positions in defense_map.items():
+                    coords = [f"({x},{y})" for x, y, c in positions]
+                    logger.info(f"  - {cls}: {', '.join(coords)}")
+            else:
+                logger.info("[INTEL] No defenses detected by YOLO.")
+        
+        logger.info("=" * 50)
         
         def generate_line_points(start, end, num_points):
             points = []
@@ -155,214 +167,235 @@ class CocBot:
                 points.append((x, y))
             return points
 
+        def get_cached_target(target_class):
+            """Get the best target position from cached YOLO scan."""
+            if target_class in defense_map and defense_map[target_class]:
+                best = max(defense_map[target_class], key=lambda d: d[2])
+                return best[0], best[1]
+            return None, None
+
+        # Defense threat priority for smart freeze (highest threat first)
+        DEFENSE_PRIORITY = [
+            "eagle",        # Eagle Artillery - most dangerous
+            "inferno",      # Inferno Tower - melts everything
+            "scattershot",  # Scattershot - heavy splash
+            "xbow",         # X-Bow - high DPS
+            "ad",           # Air Defense - kills dragons
+            "wizztower",    # Wizard Tower - splash air
+            "airsweeper",   # Air Sweeper - pushes dragons back
+        ]
+
+        def get_smart_freeze_targets(count):
+            """Return a list of (class, x, y) targets sorted by threat priority."""
+            priority_targets = []
+            for defense_class in DEFENSE_PRIORITY:
+                if defense_class in defense_map:
+                    for x, y, conf in defense_map[defense_class]:
+                        priority_targets.append((defense_class, x, y, conf))
+            # Already sorted by priority order since we iterate DEFENSE_PRIORITY in order
+            return priority_targets[:count]
+
         def deploy_card(troop_name, count, target_area, verify_depleted=True):
             if count <= 0:
                 return True
+            
+            # Auto-skip verification for single-use troops (heroes, siege machines)
+            # They only have 1 unit so no need to re-check after deploying
+            original_count = count
+            if original_count == 1:
+                verify_depleted = False
                 
-            # Heroes and Siege Machines need a lower threshold because their health bar changes their appearance.
-            # Regular troops and spells need a balanced threshold (0.7) so they don't accidentally match each other,
-            # but they still match even if the remaining troop count number changes on the card!
             threshold = 0.55 if troop_name in ["grand_warden", "minion_prince", "stone_slammer", "barbarian_king", "archer_queen", "royal_champion", "battle_machine"] else 0.7
             
             while True:
-                # Always take a fresh screenshot so we know the EXACT current position of the card,
-                # because the troop bar shifts left whenever a troop is completely depleted!
                 current_screen = self.bot.take_screenshot("temp_screen.png")
                 if current_screen is None:
-                    time.sleep(1)
+                    time.sleep(0.3)
                     continue
                     
                 match = self.vision.find_image(troop_name, current_screen, threshold=threshold, check_saturation=True)
                 if not match:
-                    # Swipe right-to-left to reveal hidden troops on the right side of the bar
-                    logger.debug(f"'{troop_name}' not immediately found. Swiping troop bar to check...")
-                    self.bot.swipe(int(w * 0.8), int(h * 0.92), int(w * 0.2), int(h * 0.92), duration=0.5)
-                    time.sleep(1.0)
+                    # One quick swipe to check for hidden troops
+                    self.bot.swipe(int(w * 0.8), int(h * 0.92), int(w * 0.2), int(h * 0.92), duration=0.2)
+                    time.sleep(0.3)
                     
                     current_screen = self.bot.take_screenshot("temp_screen.png")
                     if current_screen is not None:
                         match = self.vision.find_image(troop_name, current_screen, threshold=threshold, check_saturation=True)
                         
                     if not match:
-                        logger.info(f"[DEPLOY] Successfully deployed all '{troop_name}'.")
+                        logger.info(f"[DEPLOY] '{troop_name}' not on bar. Skipping.")
                         return True
                     
                 card_x, card_y, _ = match
-                logger.info(f"[DEPLOY] Active: Deploying {troop_name}...")
+                logger.info(f"[DEPLOY] Deploying {troop_name}...")
                 
                 # Select the card
                 self.bot.tap(card_x, card_y)
-                time.sleep(0.2)
+                time.sleep(0.1)
                 
-                # Drop it rapidly based on count
+                # Drop rapidly based on target
                 actual_taps = max(1, count)
+                
                 if target_area == "single":
                     mid_x = (edge_start[0] + edge_end[0]) // 2
                     mid_y = (edge_start[1] + edge_end[1]) // 2
                     for _ in range(actual_taps):
                         self.bot.tap(mid_x, mid_y)
-                        time.sleep(0.05)
+                        time.sleep(0.03)
+                        
                 elif target_area == "edge":
                     points = generate_line_points(edge_start, edge_end, actual_taps)
                     for px, py in points:
                         self.bot.tap(px, py)
-                        time.sleep(0.05)
+                        time.sleep(0.03)
+                        
                 elif target_area == "core":
                     for _ in range(actual_taps):
                         self.bot.tap(core[0], core[1])
-                        time.sleep(0.05)
+                        time.sleep(0.03)
+                        
                 elif target_area == "dynamic_dragon":
+                    # Use live scan for dragons (they move)
                     target_x, target_y = None, None
                     for d_temp in ["dynamic_dragon_1", "dynamic_dragon_2"]:
                         d_match = self.vision.find_image(d_temp, current_screen, threshold=0.5)
                         if d_match:
                             target_x, target_y, _ = d_match
-                            logger.info(f"Found live dragon at {target_x}, {target_y}!")
-                            break
-                    if target_x is not None:
-                        for _ in range(actual_taps):
-                            self.bot.tap(target_x, target_y)
-                            time.sleep(0.05)
-                    else:
-                        logger.info("Live dragon not found! Falling back to push zone.")
-                        edge_mid_x = (edge_start[0] + edge_end[0]) // 2
-                        edge_mid_y = (edge_start[1] + edge_end[1]) // 2
-                        push_x = (edge_mid_x + core[0]) // 2
-                        push_y = (edge_mid_y + core[1]) // 2
-                        for _ in range(actual_taps):
-                            self.bot.tap(push_x, push_y)
-                            time.sleep(0.05)
-                elif target_area == "dynamic_defense":
-                    target_x, target_y = None, None
-                    
-                    # Try YOLO first
-                    detections = self.vision.detect_objects(current_screen, target_classes=["inferno", "ad", "eagle", "scattershot", "xbow", "wizztower", "canon", "mortar", "bombtower"])
-                    if detections:
-                        logger.info(f"Found {len(detections)} live defenses via YOLO!")
-                        for i in range(actual_taps):
-                            det = detections[i % len(detections)]
-                            cls_name, tx, ty, conf = det
-                            logger.info(f"Dropping on {cls_name} at {tx}, {ty} (conf: {conf:.2f})")
-                            self.bot.tap(tx, ty)
-                            time.sleep(0.05)
-                    else:
-                        # Fallback to templates
-                        for d_temp in ["dynamic_inferno", "dynamic_air_defense"]:
-                            d_match = self.vision.find_image(d_temp, current_screen, threshold=0.55)
-                            if d_match:
-                                target_x, target_y, _ = d_match
-                                logger.info(f"Found live defense ({d_temp}) at {target_x}, {target_y}!")
-                                break
-                        
-                        if target_x is not None:
-                            for _ in range(actual_taps):
-                                self.bot.tap(target_x, target_y)
-                                time.sleep(0.05)
-                        else:
-                            logger.info("Live defense not found! Falling back to core zone.")
-                            for _ in range(actual_taps):
-                                self.bot.tap(core[0], core[1])
-                                time.sleep(0.05)
-                elif target_area == "townhall":
-                    target_x, target_y = None, None
-                    
-                    # Try YOLO first
-                    detections = self.vision.detect_objects(current_screen, target_classes=["th13"])
-                    if detections:
-                        cls_name, target_x, target_y, conf = detections[0]
-                        logger.info(f"Found enemy Town Hall via YOLO at {target_x}, {target_y}! (conf: {conf:.2f})")
-                    else:
-                        # Fallback to templates
-                        for i in range(14, 0, -1):
-                            th_temp = f"th_{i}"
-                            d_match = self.vision.find_image(th_temp, current_screen, threshold=0.55)
-                            if d_match:
-                                target_x, target_y, _ = d_match
-                                logger.info(f"Found enemy Town Hall (Level {i}) at {target_x}, {target_y}!")
-                                break
-                            for sub in [".1", ".2", ".3", ".4", ".5"]:
-                                sub_temp = f"th_{i}{sub}"
-                                if sub_temp in self.vision.templates:
-                                    d_match = self.vision.find_image(sub_temp, current_screen, threshold=0.55)
-                                    if d_match:
-                                        target_x, target_y, _ = d_match
-                                    logger.info(f"Found enemy Town Hall ({sub_temp}) at {target_x}, {target_y}!")
-                                    break
-                        if target_x is not None:
                             break
                             
+                    # Create a spread pattern so spells don't drop on the exact same pixel
+                    # 1st spell: Center
+                    # 2nd spell: Up-Left
+                    # 3rd spell: Down-Right
+                    offsets = [(0, 0), (-60, -40), (60, 40), (60, -40), (-60, 40)]
+                    
                     if target_x is not None:
-                        for _ in range(actual_taps):
-                            self.bot.tap(target_x, target_y)
-                            time.sleep(0.05)
-                    else:
-                        logger.info("Enemy Town Hall not found! Falling back to core zone.")
-                        for _ in range(actual_taps):
-                            self.bot.tap(core[0], core[1])
-                            time.sleep(0.05)
-                elif target_area in YOLO_CLASSES:
-                    detections = self.vision.detect_objects(current_screen, target_classes=[target_area])
-                    if detections:
-                        logger.info(f"Found {len(detections)} instances of '{target_area}' via YOLO!")
                         for i in range(actual_taps):
-                            det = detections[i % len(detections)]
-                            cls_name, tx, ty, conf = det
-                            logger.info(f"Dropping on {cls_name} at {tx}, {ty} (conf: {conf:.2f})")
-                            self.bot.tap(tx, ty)
-                            time.sleep(0.05)
+                            ox, oy = offsets[i % len(offsets)]
+                            # Select card again before each drop to ensure it registers
+                            self.bot.tap(card_x, card_y)
+                            time.sleep(0.1)
+                            self.bot.tap(target_x + ox, target_y + oy)
+                            time.sleep(0.1)
                     else:
-                        logger.info(f"Target '{target_area}' not found! Falling back to core zone.")
+                        # Fallback: between edge and core
+                        push_x = (edge_start[0] + edge_end[0] + core[0] * 2) // 4
+                        push_y = (edge_start[1] + edge_end[1] + core[1] * 2) // 4
+                        for i in range(actual_taps):
+                            ox, oy = offsets[i % len(offsets)]
+                            self.bot.tap(card_x, card_y)
+                            time.sleep(0.1)
+                            self.bot.tap(push_x + ox, push_y + oy)
+                            time.sleep(0.1)
+                            
+                elif target_area == "dynamic_defense":
+                    # Use CACHED defense positions from pre-scan!
+                    if all_defenses:
+                        logger.info(f"[INTEL] Using {len(all_defenses)} cached defense positions!")
+                        for i in range(actual_taps):
+                            det = all_defenses[i % len(all_defenses)]
+                            cls_name, tx, ty, conf = det
+                            logger.info(f"  -> Dropping on {cls_name} at ({tx},{ty})")
+                            self.bot.tap(tx, ty)
+                            time.sleep(0.03)
+                    else:
+                        logger.info("[INTEL] No cached defenses. Falling back to core.")
                         for _ in range(actual_taps):
                             self.bot.tap(core[0], core[1])
-                            time.sleep(0.05)
+                            time.sleep(0.03)
+                            
+                elif target_area == "smart_freeze":
+                    # Smart freeze: prioritize highest-threat defenses!
+                    targets = get_smart_freeze_targets(actual_taps)
+                    if targets:
+                        logger.info(f"[SMART FREEZE] Targeting {len(targets)} high-priority defenses!")
+                        for cls_name, tx, ty, conf in targets:
+                            logger.info(f"  [FREEZE] {cls_name} at ({tx},{ty}) [conf:{conf:.2f}]")
+                            # Select freeze spell card again for each tap
+                            self.bot.tap(card_x, card_y)
+                            time.sleep(0.1)
+                            self.bot.tap(tx, ty)
+                            time.sleep(0.3)
+                    else:
+                        logger.info("[SMART FREEZE] No defenses found. Dropping at core.")
+                        for _ in range(actual_taps):
+                            self.bot.tap(core[0], core[1])
+                            time.sleep(0.03)
+                            
+                elif target_area == "townhall":
+                    # Use cached TH position from pre-scan
+                    tx, ty = get_cached_target("th13")
+                    if tx is not None:
+                        logger.info(f"[INTEL] Town Hall found at ({tx},{ty}) from pre-scan!")
+                        for _ in range(actual_taps):
+                            self.bot.tap(tx, ty)
+                            time.sleep(0.03)
+                    else:
+                        logger.info("[INTEL] Town Hall not in pre-scan. Dropping at core.")
+                        for _ in range(actual_taps):
+                            self.bot.tap(core[0], core[1])
+                            time.sleep(0.03)
+                            
+                elif target_area in YOLO_CLASSES:
+                    # Use CACHED positions from pre-scan!
+                    tx, ty = get_cached_target(target_area)
+                    if tx is not None:
+                        positions = defense_map.get(target_area, [])
+                        logger.info(f"[INTEL] Using cached {target_area} positions ({len(positions)} found)!")
+                        for i in range(actual_taps):
+                            pos = positions[i % len(positions)]
+                            logger.info(f"  -> Dropping on {target_area} at ({pos[0]},{pos[1]})")
+                            self.bot.tap(pos[0], pos[1])
+                            time.sleep(0.03)
+                    else:
+                        logger.info(f"[INTEL] '{target_area}' not in pre-scan. Falling back to core.")
+                        for _ in range(actual_taps):
+                            self.bot.tap(core[0], core[1])
+                            time.sleep(0.03)
                         
-                time.sleep(0.5)
+                time.sleep(0.1)
                 
                 if not verify_depleted:
                     return True
                     
-                # Take a fresh screenshot to verify it actually disappeared
                 current_screen = self.bot.take_screenshot("temp_screen.png")
                 if current_screen is None:
-                    time.sleep(1)
+                    time.sleep(0.3)
                     return True
                     
-                # If we loop again, we only drop 1 at a time to catch any stragglers
                 count = 1
 
+        # ============================================================
         # EXECUTE DEPLOYMENT SEQUENCE
+        # ============================================================
         logger.info("Executing Dynamic Deployment Sequence...")
         
-        # Scroll the village map to the top
-        logger.info("Scrolling the village map to the top...")
-        # Swipe from top to bottom in the center to drag the map down (revealing the top)
-        self.bot.swipe(int(w * 0.5), int(h * 0.3), int(w * 0.5), int(h * 0.8), duration=0.5)
-        time.sleep(1.0)
+        # Scroll village map to top
+        self.bot.swipe(int(w * 0.5), int(h * 0.3), int(w * 0.5), int(h * 0.7), duration=0.3)
+        time.sleep(0.5)
         
-        # Ensure troop bar is scrolled to the top (leftmost) position before deploying
-        logger.info("Scrolling troop deployment bar to the top...")
-        # Swipe left-to-right across the bottom 10% of the screen
-        self.bot.swipe(int(w * 0.2), int(h * 0.92), int(w * 0.8), int(h * 0.92), duration=0.5)
-        time.sleep(1.0) # Wait for swipe momentum to settle
+        # Scroll troop bar to the start
+        logger.info("Scrolling troop bar to start...")
+        self.bot.swipe(int(w * 0.2), int(h * 0.92), int(w * 0.8), int(h * 0.92), duration=0.3)
+        time.sleep(0.5)
         
         for step in config.DEPLOYMENT_SEQUENCE:
             troop_name = step.get("name")
             count = step.get("count", 1)
             target_area = step.get("target", "edge")
             delay = step.get("delay", 0)
-            verify = step.get("verify", True) # Default to True so it loops until depleted
+            verify = step.get("verify", True)
             
             if count > 0:
-                logger.info(f"--- Sequence Step: {troop_name} x{count} -> {target_area} ---")
+                logger.info(f"--- Step: {troop_name} x{count} -> {target_area} ---")
                 deploy_card(troop_name, count, target_area, verify_depleted=verify)
                 
                 if delay > 0:
-                    logger.info(f"Sequence delay: Waiting {delay} seconds...")
+                    logger.info(f"Waiting {delay}s...")
                     time.sleep(delay)
         
-        logger.info("All troops and spells deployed! Bot will now monitor for the Return Home button...")
-        # No need to sleep for 150 seconds anymore! 
-        # The state machine will naturally wait in "UNKNOWN" until "BATTLE_FINISHED" appears.
+        logger.info("All troops deployed! Monitoring for Return Home...")
 
     def handle_battle_finished(self, screen):
         """Logic for returning home after a battle ends"""
@@ -371,7 +404,7 @@ class CocBot:
             x, y, _ = match
             logger.info(f"Found 'Return Home' button at ({x}, {y}). Clicking...")
             self.bot.tap(x, y)
-            time.sleep(3) # Wait for the loading screen back to home 
+            time.sleep(3)
 
 if __name__ == "__main__":
     bot = CocBot()
