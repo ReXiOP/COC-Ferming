@@ -5,6 +5,9 @@ import os
 import cv2
 import numpy as np
 
+# Clash of Clans package name
+COC_PACKAGE = "com.supercell.clashofclans"
+
 class BotCore:
     def __init__(self, serial=None):
         self.adb = adbutils.adb
@@ -84,6 +87,51 @@ class BotCore:
             return True
         except Exception as e:
             logger.info(f"Swipe failed: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # App lifecycle helpers
+    # ------------------------------------------------------------------
+
+    def is_app_running(self):
+        """Return True if Clash of Clans is the foreground activity."""
+        if not self.device:
+            return False
+        try:
+            output = self.device.shell(
+                "dumpsys window windows | grep -E 'mCurrentFocus|mFocusedApp'"
+            )
+            return COC_PACKAGE in output
+        except Exception as e:
+            logger.warning(f"is_app_running check failed: {e}")
+            return False
+
+    def launch_app(self):
+        """Launch Clash of Clans via ADB monkey intent."""
+        if not self.device:
+            logger.error("Cannot launch app – no device connected.")
+            return False
+        try:
+            logger.info(f"Launching {COC_PACKAGE} via ADB...")
+            self.device.shell(
+                f"monkey -p {COC_PACKAGE} -c android.intent.category.LAUNCHER 1"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"launch_app failed: {e}")
+            return False
+
+    def force_restart_app(self):
+        """Force-stop then re-launch Clash of Clans."""
+        if not self.device:
+            return False
+        try:
+            logger.warning(f"Force-stopping {COC_PACKAGE}...")
+            self.device.shell(f"am force-stop {COC_PACKAGE}")
+            time.sleep(2)
+            return self.launch_app()
+        except Exception as e:
+            logger.error(f"force_restart_app failed: {e}")
             return False
 
 if __name__ == "__main__":

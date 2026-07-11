@@ -195,6 +195,45 @@ class Vision:
                 filtered_matches.append(m)
                 
         return filtered_matches
+        
+    def read_loot(self, screen_img):
+        if screen_img is None:
+            return None, None
+            
+        # Initialize easyocr lazily
+        if not hasattr(self, 'ocr_reader'):
+            try:
+                import easyocr
+                self.ocr_reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+            except Exception as e:
+                logger.error(f"Failed to load easyocr: {e}")
+                return None, None
+                
+        # Crop the top right area (approx 1350:1600, 20:150 for 1600x900)
+        h, w = screen_img.shape[:2]
+        crop = screen_img[int(h*0.02):int(h*0.2), int(w*0.8):w]
+        
+        # Save for telegram to send
+        cv2.imwrite("loot_crop.png", crop)
+        
+        # Read text
+        results = self.ocr_reader.readtext(crop)
+        
+        # Parse text (look for large numbers)
+        import re
+        numbers = []
+        full_text = []
+        for (bbox, text, prob) in results:
+            full_text.append(text)
+            clean = re.sub(r'[^0-9]', '', text)
+            if clean:
+                try:
+                    numbers.append(int(clean))
+                except:
+                    pass
+                
+        # Return raw text and list of numbers found
+        return " | ".join(full_text), numbers
 
 if __name__ == "__main__":
     v = Vision()

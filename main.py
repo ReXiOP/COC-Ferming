@@ -16,6 +16,13 @@ class CocBot:
         # State machine
         self.state = "HOME_SCREEN"
         self.running = True
+        self.paused = False
+        self.state_start_time = time.time()
+        self.stuck_notified = False
+
+        # White-screen watchdog
+        self._white_screen_since = None   # timestamp when white screen first detected
+        self._WHITE_SCREEN_TIMEOUT = 60   # seconds before restart
 
     def start(self):
         print_banner()
@@ -26,6 +33,20 @@ class CocBot:
             return
 
         logger.info("Connected successfully!")
+
+        # ── Auto-launch CoC if it is not already in the foreground ──────
+        if not self.bot.is_app_running():
+            logger.info("Clash of Clans is not running. Launching via ADB...")
+            self.bot.launch_app()
+            logger.info("Waiting 15 s for the game to load...")
+            time.sleep(15)
+        else:
+            logger.info("Clash of Clans is already running.")
+        # ────────────────────────────────────────────────────────────────
+        
+        import telegram_bot
+        telegram_bot.send_telegram_message("✅ <b>CocBot Started</b>\nThe bot has been successfully launched and connected to the emulator.")
+        telegram_bot.start_polling(self)
         
         # Make sure templates are re-loaded
         self.vision.templates.clear()
@@ -36,18 +57,77 @@ class CocBot:
     def run_loop(self):
         try:
             while self.running:
+                if self.paused:
+                    time.sleep(1)
+                    continue
+
                 screen = self.bot.take_screenshot("current_screen.png")
                 if screen is None:
                     time.sleep(1)
                     continue
+
+                # ── White-screen watchdog ────────────────────────────────
+                if self._is_white_screen(screen):
+                    if self._white_screen_since is None:
+                        self._white_screen_since = time.time()
+                        logger.warning("White screen detected – starting watchdog timer...")
+                    elif time.time() - self._white_screen_since >= self._WHITE_SCREEN_TIMEOUT:
+                        logger.error(
+                            f"White screen persisted for >={self._WHITE_SCREEN_TIMEOUT}s. "
+                            "Force-restarting Clash of Clans..."
+                        )
+                        try:
+                            import telegram_bot
+                            telegram_bot.send_telegram_message(
+                                "⚠️ <b>White Screen Detected!</b>\n"
+                                f"The game was stuck on a white screen for {self._WHITE_SCREEN_TIMEOUT}s.\n"
+                                "Restarting Clash of Clans via ADB..."
+                            )
+                        except Exception:
+                            pass
+                        self.bot.force_restart_app()
+                        logger.info("Waiting 20 s for the game to reload after restart...")
+                        time.sleep(20)
+                        self._white_screen_since = None
+                        self.state = "HOME_SCREEN"
+                        self.state_start_time = time.time()
+                    else:
+                        elapsed_ws = time.time() - self._white_screen_since
+                        logger.debug(f"White screen watchdog: {elapsed_ws:.0f}s / {self._WHITE_SCREEN_TIMEOUT}s")
+                    time.sleep(1)
+                    continue
+                else:
+                    # Screen is no longer white – reset watchdog
+                    if self._white_screen_since is not None:
+                        logger.info("White screen cleared.")
+                        self._white_screen_since = None
+                # ──────────────────────────────────────────────────────────
 
                 # 1. Determine current state based on what we see on screen
                 state = self.detect_state(screen)
                 if state != self.state:
                     logger.info(f"[STATE CHANGE] {self.state} -> {state}")
                     self.state = state
+                    self.state_start_time = time.time()
+                    self.stuck_notified = False
                 else:
                     logger.debug(f"Detected State: {self.state}")
+                    
+                    elapsed = time.time() - self.state_start_time
+                    # 2 minutes for all states
+                    timeout = 120
+                    
+                    if elapsed > timeout and not self.stuck_notified:
+                        error_msg = f"⚠️ <b>Bot Stuck!</b>\nThe bot has been stuck in the {self.state} state for {timeout//60} minutes. Please check the emulator."
+                        logger.error(error_msg.replace("<b>", "").replace("</b>", "").replace("⚠️ ", ""))
+                        
+                        try:
+                            import telegram_bot
+                            telegram_bot.send_telegram_message(error_msg)
+                        except Exception as e:
+                            logger.error(f"Failed to send Telegram notification: {e}")
+                            
+                        self.stuck_notified = True
 
                 # 2. Execute action for that state
                 if self.state == "HOME_SCREEN":
@@ -67,6 +147,23 @@ class CocBot:
         except KeyboardInterrupt:
             logger.info("\nBot stopped by user.")
 
+    # ------------------------------------------------------------------
+    # White-screen helpers
+    # ------------------------------------------------------------------
+
+    def _is_white_screen(self, screen, threshold=0.85):
+        """
+        Return True if more than `threshold` fraction of the screen pixels
+        are nearly white (R, G, B all >= 240).
+        This catches the loading/blank-white freeze that CoC shows occasionally.
+        """
+        if screen is None:
+            return False
+        # screen is BGR; white means all channels >= 240
+        white_mask = np.all(screen >= 240, axis=2)
+        white_ratio = white_mask.sum() / white_mask.size
+        return white_ratio >= threshold
+
     def detect_state(self, screen):
         """Determine what screen we are on based on visible buttons"""
         if self.vision.find_image("return_home_button", screen, threshold=0.65):
@@ -82,6 +179,28 @@ class CocBot:
         return "UNKNOWN"
 
     def handle_home_screen(self, screen):
+        # Periodically check loot (every 30 mins = 1800s)
+        current_time = time.time()
+        if not hasattr(self, 'last_loot_check_time'):
+            self.last_loot_check_time = 0
+            
+        if current_time - self.last_loot_check_time > 800:
+            logger.info("Performing periodic loot check...")
+            self.last_loot_check_time = current_time
+            text, numbers = self.vision.read_loot(screen)
+            if numbers:
+                is_full = False
+                for num in numbers:
+                    # Check if over 18M (close to 18.5M max gold or 21M max elixir)
+                    if num >= 18000000: 
+                        is_full = True
+                        break
+                if is_full:
+                    logger.info("Storage is full! Sending alert...")
+                    import telegram_bot
+                    telegram_bot.send_telegram_message("🚨 <b>Storage Full Alert!</b> 🚨\nYour storages are at max capacity.")
+                    telegram_bot.send_telegram_loot(self)
+
         match = self.vision.find_image("home_attack_button", screen, threshold=0.65)
         if match:
             x, y, _ = match
@@ -186,16 +305,35 @@ class CocBot:
         ]
 
         def get_smart_freeze_targets(count):
-            """Return a list of (class, x, y) targets sorted by threat priority."""
+            """Return a list of (class, x, y) targets sorted by threat priority and confidence."""
             priority_targets = []
             for defense_class in DEFENSE_PRIORITY:
                 if defense_class in defense_map:
-                    for x, y, conf in defense_map[defense_class]:
-                        priority_targets.append((defense_class, x, y, conf))
-            # Already sorted by priority order since we iterate DEFENSE_PRIORITY in order
+                    # Sort defenses of this class by confidence (highest first)
+                    sorted_defenses = sorted(defense_map[defense_class], key=lambda d: d[2], reverse=True)
+                    for x, y, conf in sorted_defenses:
+                        # Only target if confidence is decently high to avoid false positives
+                        if conf >= 0.50:
+                            priority_targets.append((defense_class, x, y, conf))
+                            
+            # Fallback: if we didn't find enough high-confidence targets, include lower confidence ones
+            if len(priority_targets) < count:
+                for defense_class in DEFENSE_PRIORITY:
+                    if defense_class in defense_map:
+                        sorted_defenses = sorted(defense_map[defense_class], key=lambda d: d[2], reverse=True)
+                        for x, y, conf in sorted_defenses:
+                            if conf < 0.50 and (defense_class, x, y, conf) not in priority_targets:
+                                priority_targets.append((defense_class, x, y, conf))
+                                
+            # Already sorted by priority order, and now within each priority, by highest confidence
             return priority_targets[:count]
 
-        def deploy_card(troop_name, count, target_area, verify_depleted=True):
+        HERO_NAMES = [
+            "barbarian_king", "archer_queen", "grand_warden",
+            "minion_prince", "royal_champion", "battle_machine"
+        ]
+
+        def deploy_card(troop_name, count, target_area, verify_depleted=True, use_ability=None):
             if count <= 0:
                 return True
             
@@ -204,6 +342,10 @@ class CocBot:
             original_count = count
             if original_count == 1:
                 verify_depleted = False
+            
+            # Default: activate ability for heroes automatically
+            if use_ability is None:
+                use_ability = troop_name in HERO_NAMES
                 
             threshold = 0.55 if troop_name in ["grand_warden", "minion_prince", "stone_slammer", "barbarian_king", "archer_queen", "royal_champion", "battle_machine"] else 0.7
             
@@ -355,6 +497,16 @@ class CocBot:
                             time.sleep(0.03)
                         
                 time.sleep(0.1)
+
+                # ── Hero ability activation ──────────────────────────────
+                if use_ability and troop_name in HERO_NAMES:
+                    logger.info(f"[ABILITY] Waiting 1s then activating {troop_name} ability...")
+                    time.sleep(3.0)
+                    # Tap the card again to trigger the ability
+                    self.bot.tap(card_x, card_y)
+                    logger.info(f"[ABILITY] {troop_name} ability activated!")
+                    time.sleep(0.2)
+                # ────────────────────────────────────────────────────────
                 
                 if not verify_depleted:
                     return True
@@ -386,10 +538,11 @@ class CocBot:
             target_area = step.get("target", "edge")
             delay = step.get("delay", 0)
             verify = step.get("verify", True)
+            use_ability = step.get("use_ability", None)  # None = auto-detect for heroes
             
             if count > 0:
                 logger.info(f"--- Step: {troop_name} x{count} -> {target_area} ---")
-                deploy_card(troop_name, count, target_area, verify_depleted=verify)
+                deploy_card(troop_name, count, target_area, verify_depleted=verify, use_ability=use_ability)
                 
                 if delay > 0:
                     logger.info(f"Waiting {delay}s...")

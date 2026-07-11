@@ -4,3 +4,4 @@ __pycache__/
 temp_screen.png
 test_screenshot.png
 .pytest_cache/
+.env
