@@ -86,10 +86,10 @@ class Vision:
                     self.templates[name] = template_img
                     logger.debug(f"Loaded template: {name}")
 
-    def find_image(self, target_name, screen_img, threshold=0.8, check_saturation=False):
+    def find_image(self, target_name, screen_img, threshold=0.8, check_saturation=False, full_screen_h=None):
         """
-        Finds a template image within the screen image.
-        Returns the (x, y) coordinates of the center of the match, or None if not found.
+        Finds a template image within the screen image across multiple scales
+        to automatically support any screen resolution.
         """
         if target_name not in self.templates:
             logger.info(f"Template '{target_name}' not found.")
@@ -98,35 +98,69 @@ class Vision:
         if screen_img is None:
             return None
 
-        template = self.templates[target_name]
-        
-        # Ensure template is not larger than screen to prevent OpenCV crashes
-        th, tw = template.shape[:2]
+        original_template = self.templates[target_name]
         sh, sw = screen_img.shape[:2]
-        if th > sh or tw > sw:
-            scale = min(sh / th, sw / tw)
-            new_w, new_h = int(tw * scale), int(th * scale)
-            template = cv2.resize(template, (new_w, new_h))
-            logger.debug(f"Resized template '{target_name}' from {tw}x{th} to {new_w}x{new_h} to fit screen.")
-            th, tw = new_h, new_w # update dimensions for center calculation
-
-        # Perform template matching
-        # cv2.matchTemplate compares the template against overlapping regions of the screen image
-        result = cv2.matchTemplate(screen_img, template, cv2.TM_CCOEFF_NORMED)
         
-        # Get the best match position
-        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+        # The true screen height used for scaling
+        true_h = full_screen_h if full_screen_h is not None else sh
+        
+        # We will track the best match across different scales
+        best_match = None
+        best_val = -1
+        best_loc = None
+        best_scale = 1.0
+        best_template_shape = (0, 0)
+        
+        # Determine if we have a cached scale factor for this screen height
+        if not hasattr(self, "cached_scale") or self.last_screen_h != true_h:
+            self.cached_scale = None
+            self.last_screen_h = true_h
+            
+        # Exactly calculate the scale based on the vertical resolution.
+        # The templates were captured on a 900p screen (e.g. 1600x900).
+        # Clash of Clans UI scales strictly with the screen height.
+        if hasattr(self, "cached_scale") and self.cached_scale is not None:
+            scales_to_check = [self.cached_scale]
+        else:
+            # Dynamically calculate exact scale
+            exact_scale = true_h / 900.0
+            # Test the exact scale, and slightly smaller/larger just in case of rounding
+            scales_to_check = [exact_scale, exact_scale * 0.98, exact_scale * 1.02]
 
-        if max_val >= threshold:
-            # max_loc gives the top-left corner of the match
-            # We want to return the center coordinates for clicking
-            h, w = template.shape[:2]
+        for scale in scales_to_check:
+            # Resize template
+            th, tw = original_template.shape[:2]
+            new_w, new_h = int(tw * scale), int(th * scale)
+            
+            # Skip if template becomes too small or larger than screen
+            if new_w < 10 or new_h < 10 or new_h > sh or new_w > sw:
+                continue
+                
+            template = cv2.resize(original_template, (new_w, new_h))
+            
+            # Perform template matching
+            result = cv2.matchTemplate(screen_img, template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            if max_val > best_val:
+                best_val = max_val
+                best_loc = max_loc
+                best_scale = scale
+                best_template_shape = (new_h, new_w)
+                
+        # If the best match meets our threshold
+        if best_val >= threshold and best_loc is not None:
+            # Cache the successful scale factor to speed up future searches on this screen size
+            if self.cached_scale is None:
+                logger.info(f"Screen scale factor automatically determined as {best_scale:.2f}x")
+                self.cached_scale = best_scale
+                
+            h, w = best_template_shape
             
             if check_saturation:
-                top_y, top_x = max_loc[1], max_loc[0]
+                top_y, top_x = best_loc[1], best_loc[0]
                 bottom_y, bottom_x = top_y + h, top_x + w
                 
-                # Make sure bounds are valid
                 top_y = max(0, top_y)
                 bottom_y = min(sh, bottom_y)
                 top_x = max(0, top_x)
@@ -140,16 +174,16 @@ class Vision:
                         logger.debug(f"Template '{target_name}' matched but is grayed out (sat: {saturation:.1f}).")
                         return None
                         
-            center_x = max_loc[0] + w // 2
-            center_y = max_loc[1] + h // 2
-            return (center_x, center_y, max_val)
+            center_x = best_loc[0] + w // 2
+            center_y = best_loc[1] + h // 2
+            return (center_x, center_y, best_val)
         
         return None
 
     def find_all_images(self, target_name, screen_img, threshold=0.8):
         """
         Finds all occurrences of a template image within the screen image.
-        Returns a list of (x, y) coordinates of the centers of the matches.
+        Uses the cached scale factor if available.
         """
         if target_name not in self.templates:
             logger.info(f"Template '{target_name}' not found.")
@@ -158,37 +192,36 @@ class Vision:
         if screen_img is None:
             return []
 
-        template = self.templates[target_name]
-        
-        th, tw = template.shape[:2]
+        original_template = self.templates[target_name]
         sh, sw = screen_img.shape[:2]
-        if th > sh or tw > sw:
-            scale = min(sh / th, sw / tw)
-            new_w, new_h = int(tw * scale), int(th * scale)
-            template = cv2.resize(template, (new_w, new_h))
-            th, tw = new_h, new_w
-
+        
+        # Use cached scale if available, otherwise 1.0
+        scale = getattr(self, "cached_scale", 1.0)
+        if scale is None:
+            scale = 1.0
+            
+        th, tw = original_template.shape[:2]
+        new_w, new_h = int(tw * scale), int(th * scale)
+        
+        if new_w < 10 or new_h < 10 or new_h > sh or new_w > sw:
+            return []
+            
+        template = cv2.resize(original_template, (new_w, new_h))
         result = cv2.matchTemplate(screen_img, template, cv2.TM_CCOEFF_NORMED)
         
-        # Find all locations where the match value is above the threshold
         locations = np.where(result >= threshold)
-        
         matches = []
         
-        # locations is a tuple of (y_coords, x_coords)
-        for pt in zip(*locations[::-1]):  # zip to (x, y) pairs
-            center_x = pt[0] + tw // 2
-            center_y = pt[1] + th // 2
+        for pt in zip(*locations[::-1]):
+            center_x = pt[0] + new_w // 2
+            center_y = pt[1] + new_h // 2
             matches.append((center_x, center_y))
             
-        # Optional: Group close matches together to avoid clicking the same object multiple times
-        # This is a simplified grouping approach
         filtered_matches = []
         for m in matches:
             is_new = True
             for fm in filtered_matches:
-                # If distance is small, consider it the same object
-                if abs(m[0] - fm[0]) < tw//2 and abs(m[1] - fm[1]) < th//2:
+                if abs(m[0] - fm[0]) < new_w//2 and abs(m[1] - fm[1]) < new_h//2:
                     is_new = False
                     break
             if is_new:

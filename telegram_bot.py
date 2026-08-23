@@ -20,7 +20,7 @@ def send_telegram_message(text):
         "text": text,
         "parse_mode": "HTML",
         "reply_markup": {
-            "keyboard": [[{"text": "/status"}, {"text": "/pause"}, {"text": "/resume"}]],
+            "keyboard": [[{"text": "/status"}, {"text": "/loot"}], [{"text": "/pause"}, {"text": "/resume"}], [{"text": "/restart"}, {"text": "/device"}]],
             "resize_keyboard": True
         }
     }
@@ -69,7 +69,7 @@ def send_telegram_status(bot_instance):
         "text": f"📋 <b>Last 10 Logs</b>\n<pre>{escaped_logs[-3000:]}</pre>",
         "parse_mode": "HTML",
         "reply_markup": {
-            "keyboard": [[{"text": "/status"}, {"text": "/loot"}], [{"text": "/pause"}, {"text": "/resume"}]],
+            "keyboard": [[{"text": "/status"}, {"text": "/loot"}], [{"text": "/pause"}, {"text": "/resume"}], [{"text": "/restart"}, {"text": "/device"}]],
             "resize_keyboard": True
         }
     }
@@ -136,6 +136,72 @@ def poll_updates(bot_instance):
                         elif text == "/loot":
                             logger.info("Loot requested via Telegram.")
                             send_telegram_loot(bot_instance)
+                        elif text == "/restart":
+                            send_telegram_message("🔄 <b>Restarting Bot...</b>\nRebooting the python script.")
+                            logger.info("Bot restarting via Telegram.")
+                            import sys
+                            # Acknowledge the update to prevent infinite restart loops
+                            try:
+                                requests.get(API_URL + "getUpdates", params={"offset": offset}, timeout=5)
+                            except Exception:
+                                pass
+                            os.execv(sys.executable, ['python'] + sys.argv)
+                        elif text.startswith("/device"):
+                            import adbutils
+                            try:
+                                adb = adbutils.AdbClient(host="127.0.0.1", port=5037)
+                                devices = adb.device_list()
+                                
+                                inline_kb = {"inline_keyboard": []}
+                                for i, d in enumerate(devices):
+                                    inline_kb["inline_keyboard"].append([{"text": f"📱 {d.serial}", "callback_data": f"device_{d.serial}"}])
+                                
+                                url_msg = API_URL + "sendMessage"
+                                payload = {
+                                    "chat_id": TELEGRAM_CHAT_ID,
+                                    "text": "📱 <b>Select an ADB Device:</b>",
+                                    "parse_mode": "HTML",
+                                    "reply_markup": inline_kb
+                                }
+                                requests.post(url_msg, json=payload, timeout=5)
+                            except Exception as e:
+                                send_telegram_message(f"❌ ADB Error: {e}")
+                                
+                        # Handle Inline Keyboard Callbacks
+                        elif "callback_query" in update:
+                            cq = update["callback_query"]
+                            data = cq.get("data", "")
+                            
+                            # Answer the callback query to remove loading state
+                            cq_id = cq.get("id")
+                            requests.post(API_URL + "answerCallbackQuery", json={"callback_query_id": cq_id}, timeout=5)
+                            
+                            if data.startswith("device_"):
+                                target_serial = data.split("device_")[1]
+                                import adbutils
+                                try:
+                                    adb = adbutils.AdbClient(host="127.0.0.1", port=5037)
+                                    devices = adb.device_list()
+                                    
+                                    target_device = None
+                                    for d in devices:
+                                        if d.serial == target_serial:
+                                            target_device = d
+                                            break
+                                            
+                                    if target_device:
+                                        send_telegram_message(f"🔄 Switching to device: <code>{target_device.serial}</code>")
+                                        bot_instance.bot.device = target_device
+                                        bot_instance.bot.serial = target_device.serial
+                                        bot_instance.bot._log_screen_size()
+                                        if hasattr(bot_instance.vision, 'cached_scale'):
+                                            bot_instance.vision.cached_scale = None
+                                            bot_instance.vision.last_screen_h = None
+                                        send_telegram_message("✅ Switched successfully!")
+                                    else:
+                                        send_telegram_message("❌ Device not found! It might have disconnected.")
+                                except Exception as e:
+                                    send_telegram_message(f"❌ Error switching device: {e}")
         except Exception as e:
             # Silence connection errors during polling to prevent log spam
             time.sleep(5)

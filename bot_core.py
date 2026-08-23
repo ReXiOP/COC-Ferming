@@ -21,11 +21,30 @@ class BotCore:
         # First, check if any device is already attached (like emulator-5554)
         devices = self.adb.device_list()
         if devices:
-            for d in devices:
-                if self.serial is None or d.serial == self.serial:
-                    self.device = d
-                    logger.info(f"Connected to existing device: {self.device.serial}")
-                    return True
+            if len(devices) > 1 and self.serial is None:
+                print("\nMultiple ADB devices found:")
+                for i, d in enumerate(devices):
+                    print(f"[{i}] {d.serial}")
+                try:
+                    choice = int(input(f"Select device number [0-{len(devices)-1}]: "))
+                    if 0 <= choice < len(devices):
+                        self.device = devices[choice]
+                        logger.info(f"Connected to selected device: {self.device.serial}")
+                        self._log_screen_size()
+                        return True
+                    else:
+                        logger.error("Invalid selection.")
+                        return False
+                except ValueError:
+                    logger.error("Invalid input. Please enter a number.")
+                    return False
+            else:
+                for d in devices:
+                    if self.serial is None or d.serial == self.serial:
+                        self.device = d
+                        logger.info(f"Connected to existing device: {self.device.serial}")
+                        self._log_screen_size()
+                        return True
 
         # If not, try to explicitly connect
         address = f"{host}:{port}"
@@ -36,12 +55,22 @@ class BotCore:
                 if self.serial is None or d.serial == self.serial or d.serial == address:
                     self.device = d
                     logger.info(f"Connected to {self.device.serial}")
+                    self._log_screen_size()
                     return True
             logger.info("Could not find the device after connecting.")
             return False
         except Exception as e:
             logger.info(f"Failed to connect: {e}")
             return False
+
+    def _log_screen_size(self):
+        """Automatically detect and log the connected device/emulator screen size"""
+        if self.device:
+            try:
+                output = self.device.shell("wm size")
+                logger.info(f"Auto-Detected Device Screen {output.strip()}")
+            except Exception as e:
+                logger.debug(f"Could not fetch screen size via ADB: {e}")
 
     def take_screenshot(self, filename="screen.png"):
         """Takes a screenshot and returns it as a cv2 image array, also saves it if filename is provided"""

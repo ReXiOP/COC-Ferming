@@ -141,7 +141,9 @@ class CocBot:
                 elif self.state == "BATTLE_FINISHED":
                     self.handle_battle_finished(screen)
                 else:
-                    logger.debug("Unknown state. Waiting for troops to finish or screen to change...")
+                    if not hasattr(self, '_last_unknown_log') or time.time() - self._last_unknown_log > 10:
+                        logger.info(f"Screen not recognized (State: {self.state}). Waiting for game to load or popups to clear...")
+                        self._last_unknown_log = time.time()
                     time.sleep(2)
 
         except KeyboardInterrupt:
@@ -166,15 +168,17 @@ class CocBot:
 
     def detect_state(self, screen):
         """Determine what screen we are on based on visible buttons"""
-        if self.vision.find_image("return_home_button", screen, threshold=0.65):
+        if self.vision.find_image("return_home_button", screen, threshold=0.80):
             return "BATTLE_FINISHED"
-        if self.vision.find_image("next_button", screen, threshold=0.65):
+        if self.vision.find_image("next_button", screen, threshold=0.75):
             return "ENEMY_BASE"
-        if self.vision.find_image("find_match_button", screen, threshold=0.75):
+        if self.vision.find_image("available_loot", screen, threshold=0.70):
+            return "ENEMY_BASE"
+        if self.vision.find_image("find_match_button", screen, threshold=0.70):
             return "ATTACK_MENU"
-        if self.vision.find_image("attack_green_button", screen, threshold=0.7):
+        if self.vision.find_image("attack_green_button", screen, threshold=0.70):
             return "ARMY_OVERVIEW"
-        if self.vision.find_image("home_attack_button", screen, threshold=0.65):
+        if self.vision.find_image("home_attack_button", screen, threshold=0.75):
             return "HOME_SCREEN"
         return "UNKNOWN"
 
@@ -201,7 +205,7 @@ class CocBot:
                     telegram_bot.send_telegram_message("🚨 <b>Storage Full Alert!</b> 🚨\nYour storages are at max capacity.")
                     telegram_bot.send_telegram_loot(self)
 
-        match = self.vision.find_image("home_attack_button", screen, threshold=0.65)
+        match = self.vision.find_image("home_attack_button", screen, threshold=0.60)
         if match:
             x, y, _ = match
             logger.info(f"Clicking Home 'Attack' button at ({x}, {y})...")
@@ -217,7 +221,12 @@ class CocBot:
             time.sleep(2)
 
     def handle_attack_menu(self, screen):
-        match = self.vision.find_image("find_match_button", screen, threshold=0.75)
+        # Wait for the slide-up animation to finish, then grab a fresh screenshot
+        time.sleep(1.0)
+        screen = self.bot.take_screenshot("temp_screen.png")
+        if screen is None: return
+        
+        match = self.vision.find_image("find_match_button", screen, threshold=0.70)
         if match:
             x, y, _ = match
             template_h = self.vision.templates["find_match_button"].shape[0]
@@ -347,7 +356,12 @@ class CocBot:
             if use_ability is None:
                 use_ability = troop_name in HERO_NAMES
                 
-            threshold = 0.55 if troop_name in ["grand_warden", "minion_prince", "stone_slammer", "barbarian_king", "archer_queen", "royal_champion", "battle_machine"] else 0.7
+            if troop_name in HERO_NAMES:
+                threshold = 0.45
+            elif "_spell" in troop_name:
+                threshold = 0.50
+            else:
+                threshold = 0.65
             
             while True:
                 current_screen = self.bot.take_screenshot("temp_screen.png")
@@ -397,39 +411,34 @@ class CocBot:
                         self.bot.tap(core[0], core[1])
                         time.sleep(0.03)
                         
-                elif target_area == "dynamic_dragon":
-                    # Use live scan for dragons (they move)
+                elif target_area == "dynamic_troop":
+                    # Use live scan for troops (dragons first, then heroes)
                     target_x, target_y = None, None
-                    for d_temp in ["dynamic_dragon_1", "dynamic_dragon_2"]:
-                        d_match = self.vision.find_image(d_temp, current_screen, threshold=0.5)
-                        if d_match:
-                            target_x, target_y, _ = d_match
+                    troop_templates = ["dynamic_dragon_1", "dynamic_dragon_2", "barbarian_king", "archer_queen", "grand_warden", "royal_champion"]
+                    for t_temp in troop_templates:
+                        t_match = self.vision.find_image(t_temp, current_screen, threshold=0.5)
+                        if t_match:
+                            target_x, target_y, _ = t_match
                             break
                             
-                    # Create a spread pattern so spells don't drop on the exact same pixel
-                    # 1st spell: Center
-                    # 2nd spell: Up-Left
-                    # 3rd spell: Down-Right
                     offsets = [(0, 0), (-60, -40), (60, 40), (60, -40), (-60, 40)]
                     
                     if target_x is not None:
                         for i in range(actual_taps):
                             ox, oy = offsets[i % len(offsets)]
-                            # Select card again before each drop to ensure it registers
                             self.bot.tap(card_x, card_y)
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                             self.bot.tap(target_x + ox, target_y + oy)
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                     else:
-                        # Fallback: between edge and core
                         push_x = (edge_start[0] + edge_end[0] + core[0] * 2) // 4
                         push_y = (edge_start[1] + edge_end[1] + core[1] * 2) // 4
                         for i in range(actual_taps):
                             ox, oy = offsets[i % len(offsets)]
                             self.bot.tap(card_x, card_y)
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                             self.bot.tap(push_x + ox, push_y + oy)
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                             
                 elif target_area == "dynamic_defense":
                     # Use CACHED defense positions from pre-scan!
@@ -454,16 +463,15 @@ class CocBot:
                         logger.info(f"[SMART FREEZE] Targeting {len(targets)} high-priority defenses!")
                         for cls_name, tx, ty, conf in targets:
                             logger.info(f"  [FREEZE] {cls_name} at ({tx},{ty}) [conf:{conf:.2f}]")
-                            # Select freeze spell card again for each tap
                             self.bot.tap(card_x, card_y)
-                            time.sleep(0.1)
+                            time.sleep(0.05)
                             self.bot.tap(tx, ty)
-                            time.sleep(0.3)
+                            time.sleep(0.05)
                     else:
                         logger.info("[SMART FREEZE] No defenses found. Dropping at core.")
                         for _ in range(actual_taps):
                             self.bot.tap(core[0], core[1])
-                            time.sleep(0.03)
+                            time.sleep(0.02)
                             
                 elif target_area == "townhall":
                     # Use cached TH position from pre-scan
@@ -472,12 +480,12 @@ class CocBot:
                         logger.info(f"[INTEL] Town Hall found at ({tx},{ty}) from pre-scan!")
                         for _ in range(actual_taps):
                             self.bot.tap(tx, ty)
-                            time.sleep(0.03)
+                            time.sleep(0.02)
                     else:
                         logger.info("[INTEL] Town Hall not in pre-scan. Dropping at core.")
                         for _ in range(actual_taps):
                             self.bot.tap(core[0], core[1])
-                            time.sleep(0.03)
+                            time.sleep(0.02)
                             
                 elif target_area in YOLO_CLASSES:
                     # Use CACHED positions from pre-scan!
@@ -501,11 +509,11 @@ class CocBot:
                 # ── Hero ability activation ──────────────────────────────
                 if use_ability and troop_name in HERO_NAMES:
                     logger.info(f"[ABILITY] Waiting 1s then activating {troop_name} ability...")
-                    time.sleep(3.0)
+                    time.sleep(1.0)
                     # Tap the card again to trigger the ability
                     self.bot.tap(card_x, card_y)
                     logger.info(f"[ABILITY] {troop_name} ability activated!")
-                    time.sleep(0.2)
+                    time.sleep(0.1)
                 # ────────────────────────────────────────────────────────
                 
                 if not verify_depleted:
@@ -516,7 +524,91 @@ class CocBot:
                     time.sleep(0.3)
                     return True
                     
-                count = 1
+                # Drastically speed up by deploying in larger batches instead of 1 by 1
+                count = 15
+
+        # ============================================================
+        # PHASE 1: SCAN AVAILABLE TROOPS
+        # ============================================================
+        logger.info("=" * 50)
+        logger.info("[INTEL] Scanning available troops on deployment bar...")
+        
+        # Scroll troop bar to the start
+        self.bot.swipe(int(w * 0.2), int(h * 0.85), int(w * 0.8), int(h * 0.85), duration=0.3)
+        time.sleep(0.5)
+        
+        HEROES = ["barbarian_king", "archer_queen", "grand_warden", "royal_champion", "minion_prince", "battle_machine"]
+        SIEGE = ["stone_slammer", "wall_wrecker", "battle_blimp", "log_launcher", "flame_flinger", "battle_drill"]
+        SPELLS = ["rage_spell", "freeze_spell", "healing_spell", "jump_spell", "poison_spell", "earthquake_spell", "haste_spell", "skeleton_spell", "bat_spell", "invisibility_spell", "recall_spell", "clone_spell", "lightning_spell"]
+        UI_ELEMENTS = ["attack_green_button", "home_attack_button", "find_match_button", "next_button", "return_home_button", "_full_bar", "available_loot", "dynamic_air_defense", "dynamic_dragon_1", "dynamic_dragon_2", "dynamic_inferno", "army_overview_screen", "troop_deploy_bar", "spell_top_crop"]
+        
+        TROOPS = []
+        for t in self.vision.templates.keys():
+            if t not in HEROES and t not in SIEGE and t not in SPELLS and t not in UI_ELEMENTS and not t.startswith("th_"):
+                TROOPS.append(t)
+                
+        available_cards = {}
+        
+        # We swipe a few times to see all cards
+        for swipe_idx in range(3):
+            current_screen = self.bot.take_screenshot("temp_screen.png")
+            if current_screen is not None:
+                h, w = current_screen.shape[:2]
+                # Crop to bottom 25% to speed up template matching by 4x
+                deploy_bar = current_screen[int(h * 0.75):, :]
+                
+                for category, card_list in [("HERO", HEROES), ("SIEGE", SIEGE), ("SPELL", SPELLS), ("TROOP", TROOPS)]:
+                    for card in card_list:
+                        if card not in available_cards:
+                            # Lower threshold to account for pets and x30 badges
+                            if card in HEROES:
+                                thresh = 0.45
+                            elif card in SPELLS:
+                                thresh = 0.50
+                            else:
+                                thresh = 0.65
+                            match = self.vision.find_image(card, deploy_bar, threshold=thresh, check_saturation=True, full_screen_h=h)
+                            if match:
+                                # We found it! We could try OCR here to get exact number, but it's unreliable on tiny red icons.
+                                # Instead, we record it and will rely on verify_depleted=True to deploy all of them.
+                                available_cards[card] = category
+            
+            if swipe_idx < 2:
+                # Swipe left to reveal more troops
+                self.bot.swipe(int(w * 0.8), int(h * 0.85), int(w * 0.2), int(h * 0.85), duration=0.3)
+                time.sleep(0.5)
+
+        logger.info(f"[INTEL] Found available units: {list(available_cards.keys())}")
+        
+        # Build dynamic sequence
+        dynamic_sequence = []
+        
+        # 1. Main Troops
+        for card, cat in available_cards.items():
+            if cat == "TROOP":
+                dynamic_sequence.append({"name": card, "count": 35, "target": "edge", "delay": 0, "verify": True})
+                
+        # 2. Heroes
+        for card, cat in available_cards.items():
+            if cat == "HERO":
+                dynamic_sequence.append({"name": card, "count": 1, "target": "single", "delay": 0, "verify": False})
+                
+        # 3. Siege
+        for card, cat in available_cards.items():
+            if cat == "SIEGE":
+                dynamic_sequence.append({"name": card, "count": 1, "target": "townhall", "delay": 0, "verify": False})
+                
+        # 4. Spells
+        for card, cat in available_cards.items():
+            if cat == "SPELL":
+                if card == "freeze_spell":
+                    dynamic_sequence.append({"name": card, "count": 2, "target": "smart_freeze", "delay": 0, "verify": True})
+                elif card == "rage_spell" or card == "healing_spell":
+                    dynamic_sequence.append({"name": card, "count": 2, "target": "dynamic_troop", "delay": 0, "verify": True})
+                elif card == "poison_spell":
+                    dynamic_sequence.append({"name": card, "count": 2, "target": "core", "delay": 0, "verify": True})
+                else:
+                    dynamic_sequence.append({"name": card, "count": 2, "target": "core", "delay": 0, "verify": True})
 
         # ============================================================
         # EXECUTE DEPLOYMENT SEQUENCE
@@ -529,10 +621,10 @@ class CocBot:
         
         # Scroll troop bar to the start
         logger.info("Scrolling troop bar to start...")
-        self.bot.swipe(int(w * 0.2), int(h * 0.92), int(w * 0.8), int(h * 0.92), duration=0.3)
+        self.bot.swipe(int(w * 0.2), int(h * 0.85), int(w * 0.8), int(h * 0.85), duration=0.3)
         time.sleep(0.5)
         
-        for step in config.DEPLOYMENT_SEQUENCE:
+        for step in dynamic_sequence:
             troop_name = step.get("name")
             count = step.get("count", 1)
             target_area = step.get("target", "edge")
